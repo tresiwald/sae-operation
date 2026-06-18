@@ -1,0 +1,29 @@
+{
+  "var_explained": 0.9621478319168091,
+  "n_live": 1846,
+  "d_sae": 9216,
+  "fingerprint_sizes": {
+    "add": 145,
+    "mul": 221,
+    "sub": 152
+  },
+  "shared_core": 1,
+  "containment_add_mul": 0.02068965517098692,
+  "containment_mul_add": 0.013574660632869924,
+  "hierarchy_verdict": "SUPPORTED",
+  "linear_auc": 1.0,
+  "constant_trace": {
+    "add": {
+      "rho": 0.9999999999999999,
+      "p": NaN
+    },
+    "mul": {
+      "rho": -0.9999999999999999,
+      "p": NaN
+    },
+    "sub": {
+      "rho": -0.9999999999999999,
+      "p": NaN
+    }
+  }
+}

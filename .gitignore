@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Model weights & large data
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+models/
+model_cache/
+
+# Results & outputs (keep results.json but ignore large arrays)
+results/*.png
+results/*.npy
+results/*.npz
+
+# HuggingFace cache (if inside project)
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
