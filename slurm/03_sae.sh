@@ -2,11 +2,11 @@
 #SBATCH --job-name=sae_train
 #SBATCH --output=logs/03_sae_%A_%a.out
 #SBATCH --error=logs/03_sae_%A_%a.err
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu-single
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
-#SBATCH --gres=gpu:1
+#SBATCH --mem=80G
+#SBATCH --gres=gpu:A40:1
 #SBATCH --time=01:00:00
 #SBATCH --array=0-5        # one task per layer index; adjust to len(LAYERS)-1
 

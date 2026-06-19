@@ -2,11 +2,11 @@
 #SBATCH --job-name=sae_acts
 #SBATCH --output=logs/02_acts_%j.out
 #SBATCH --error=logs/02_acts_%j.err
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu-single
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=48G
-#SBATCH --gres=gpu:1
+#SBATCH --mem=80G
+#SBATCH --gres=gpu:A40:1
 #SBATCH --time=02:00:00
 
 # Gemma-3-1B  @ 1 record/step: ~25 min
