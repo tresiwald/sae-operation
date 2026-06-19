@@ -46,9 +46,10 @@ base_n=150
 
 acts_time_hms() {
     local n=$1
-    local secs=$(echo "$base_acts_sec * $n / $base_n * 1.5" | bc)
-    secs=$(( secs < 600 ? 600 : secs ))        # minimum 10 min
-    secs=$(( secs > 172800 ? 172800 : secs ))  # cap 48 hr
+    local secs
+    secs=$(echo "scale=0; ($base_acts_sec * $n / $base_n * 3 + 1) / 2" | bc)
+    secs=$(( secs < 600    ? 600    : secs ))   # minimum 10 min
+    secs=$(( secs > 172800 ? 172800 : secs ))   # cap 48 hr
     printf "%02d:%02d:%02d" $((secs/3600)) $(( (secs%3600)/60 )) $((secs%60))
 }
 

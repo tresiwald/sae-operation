@@ -9,8 +9,11 @@ from pathlib import Path
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT    = Path(__file__).resolve().parents[2]
-OUT_DIR = ROOT / os.getenv("SAE_OUT_DIR", "results")
+OUT_DIR = ROOT / os.getenv("SAE_OUT_DIR", "results")   # plots + JSON
+CKPT_DIR = ROOT / os.getenv("SAE_CKPT_DIR",            # large binaries → ln -s to storage tier
+                             str(OUT_DIR / "checkpoints"))
 OUT_DIR.mkdir(exist_ok=True)
+CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 MODEL_NAME = os.getenv("SAE_MODEL_NAME", "google/gemma-3-1b-pt")
@@ -47,11 +50,13 @@ MEASURE_ACCURACY = os.getenv("SAE_MEASURE_ACCURACY", "0") == "1"
 ACC_SAMPLE       = int(os.getenv("SAE_ACC_SAMPLE", "200"))
 
 # ── Checkpoint filenames ───────────────────────────────────────────────────────
-def ckpt_data()       -> Path: return OUT_DIR / "data.pkl"
-def ckpt_acts()       -> Path: return OUT_DIR / "acts_checkpoint.pt"
-def ckpt_sae(layer)   -> Path: return OUT_DIR / f"sae_L{layer}.pt"
-def ckpt_results()    -> Path: return OUT_DIR / "results.json"
-def ckpt_accuracy()   -> Path: return OUT_DIR / "accuracy.json"
+# Large binaries go to CKPT_DIR  (symlink to storage tier: ln -s /storage/... results/checkpoints)
+# Small outputs  go to OUT_DIR   (plots, JSON — keep on fast local disk)
+def ckpt_data()       -> Path: return CKPT_DIR / "data.pkl"
+def ckpt_acts()       -> Path: return CKPT_DIR / "acts_checkpoint.pt"
+def ckpt_sae(layer)   -> Path: return CKPT_DIR / f"sae_L{layer}.pt"
+def ckpt_results()    -> Path: return OUT_DIR   / "results.json"
+def ckpt_accuracy()   -> Path: return OUT_DIR   / "accuracy.json"
 
 # ── Device helper ─────────────────────────────────────────────────────────────
 def get_device():

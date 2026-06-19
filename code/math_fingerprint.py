@@ -18,7 +18,7 @@ Run:
   python code/math_fingerprint.py
 """
 
-import sys, json, re as _re, random as _random
+import os, sys, json, re as _re, random as _random
 from pathlib import Path
 from collections import defaultdict
 
@@ -71,8 +71,10 @@ DEAD_THR     = 1e-4
 FORMATS      = ["symbolic", "mixed", "verbal"]
 OPS_EVAL     = ["add", "sub", "mul", "div"]
 
-OUT_DIR = Path("results")
+OUT_DIR  = Path(os.getenv("SAE_OUT_DIR",  "results"))             # plots + JSON
+CKPT_DIR = Path(os.getenv("SAE_CKPT_DIR", str(OUT_DIR / "checkpoints")))  # large binaries
 OUT_DIR.mkdir(exist_ok=True)
+CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── 1. Model ──────────────────────────────────────────────────────────────────
 print(f"\nLoading {MODEL_NAME} in float32...")
@@ -188,7 +190,7 @@ else:
 
 # ── 6. Collect activations at all layers in one pass ─────────────────────────
 train_recs: list[dict] = train_corpus
-CKPT_ACTS = OUT_DIR / "acts_checkpoint.pt"
+CKPT_ACTS = CKPT_DIR / "acts_checkpoint.pt"
 
 norm_by_layer: dict[int, torch.Tensor] = {}
 norm_stats:    dict[int, tuple]         = {}
@@ -307,7 +309,7 @@ def train_sae(train_acts: torch.Tensor, layer_idx: int) -> tuple[TopKSAE, list, 
 # ── 8. Train SAE for each layer ───────────────────────────────────────────────
 saes:       dict[int, TopKSAE] = {}
 sae_stats:  dict[int, dict]    = {}
-CKPT_SAE = OUT_DIR / "sae_checkpoint.pt"
+CKPT_SAE = CKPT_DIR / "sae_checkpoint.pt"
 
 if CKPT_SAE.exists():
     print(f"\nLoading cached SAEs from {CKPT_SAE} ...")
