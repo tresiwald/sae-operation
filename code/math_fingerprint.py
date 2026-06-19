@@ -46,7 +46,10 @@ print(f"Inference device: {DEVICE}")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MODEL_NAME   = "google/gemma-3-1b-pt"
-LAYER        = 17
+
+# Layers to sweep. One SAE is trained per layer; all hooks fire in a single
+# inference pass. Set to None to sweep all layers.
+LAYERS       = [4, 8, 13, 17, 22, 25]   # early / mid / late coverage
 
 # n_per_cell=150 → ~10.7k training examples (80/20 split)
 N_PER_CELL   = 150
@@ -57,6 +60,9 @@ SAE_LR       = 3e-4
 SAE_EPOCHS   = 30
 SAE_BATCH    = 512
 WARMUP_STEPS = 200
+
+MEASURE_ACCURACY = False   # set True to run greedy-decode accuracy (~44 min on MPS)
+ACC_SAMPLE   = 200         # records per op to sample if MEASURE_ACCURACY=True
 
 FP_THRESHOLD = 0.5         # Cohen's d threshold for fingerprint membership
 AUX_W        = 1 / 32
@@ -74,32 +80,46 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.float32)
 model.eval().to(DEVICE)
 
-D_MODEL = model.config.hidden_size
-D_SAE   = D_MODEL * SAE_RATIO
-print(f"d_model={D_MODEL}  d_sae={D_SAE}  float32 on {DEVICE}")
+D_MODEL  = model.config.hidden_size
+D_SAE    = D_MODEL * SAE_RATIO
+N_LAYERS = model.config.num_hidden_layers
+
+if LAYERS is None:
+    LAYERS = list(range(N_LAYERS))
+
+print(f"d_model={D_MODEL}  d_sae={D_SAE}  n_layers={N_LAYERS}  sweeping={LAYERS}")
 
 preds = tokenizer("3+5=", return_tensors="pt").to(DEVICE)
 with torch.no_grad():
     lg = model(**preds).logits[0, -1].float().cpu().topk(3)
 print(f"Sanity  3+5= → {[(tokenizer.decode([i]).strip(), round(v.item(),1)) for i,v in zip(lg.indices,lg.values)]}")
 
-# ── 2. Activation hook ────────────────────────────────────────────────────────
-_buf: list[torch.Tensor] = []
+# ── 2. Multi-layer activation hooks ──────────────────────────────────────────
+# All hooks fire in a single inference pass — one buffer per layer.
+_layer_bufs: dict[int, list[torch.Tensor]] = {l: [] for l in LAYERS}
 
-def _pre_hook(module, args):
-    hidden = args[0] if isinstance(args[0], torch.Tensor) else args[0][0]
-    _buf.append(hidden[:, -1, :].detach().float().cpu())
+def _make_hook(layer_idx: int):
+    def _hook(module, args):
+        hidden = args[0] if isinstance(args[0], torch.Tensor) else args[0][0]
+        _layer_bufs[layer_idx].append(hidden[:, -1, :].detach().float().cpu())
+    return _hook
 
-hook_handle = model.model.layers[LAYER].register_forward_pre_hook(_pre_hook)
+_hook_handles = [
+    model.model.layers[l].register_forward_pre_hook(_make_hook(l))
+    for l in LAYERS
+]
 
 @torch.no_grad()
-def collect_acts(records, desc="acts"):
-    """Single-example inference; no padding NaN."""
-    _buf.clear()
-    for rec in tqdm(records, desc=desc, leave=False):
+def collect_acts_all_layers(records, desc="acts"):
+    """Single inference pass; fills _layer_bufs for every layer in LAYERS."""
+    for l in LAYERS:
+        _layer_bufs[l].clear()
+    for i, rec in enumerate(tqdm(records, desc=desc, leave=False)):
         inp = tokenizer(rec["prompt"], return_tensors="pt").to(DEVICE)
         model(**inp)
-    return torch.cat(_buf, dim=0)
+        if DEVICE.type == "mps" and i % 500 == 499:
+            torch.mps.empty_cache()
+    return {l: torch.cat(_layer_bufs[l], dim=0) for l in LAYERS}
 
 # ── 3. Accuracy (multi-token greedy decode) ───────────────────────────────────
 @torch.no_grad()
@@ -141,49 +161,78 @@ print(f"  H3 multi-op:        {len(hold_multi_compute):>6}")
 print(f"  H4 multi-op cheat:  {len(hold_multi_cheat):>6}")
 
 # ── 5. Accuracy on H1 (per-op × format × bin) ────────────────────────────────
-print("\nMeasuring accuracy (H1 per-op holdout)...")
-measure_accuracy(hold_per_op)
-
 acc_table = {}   # (op, fmt, bin) → float
-print(f"\n  {'op':4s}  {'fmt':8s}  {'bin':3s}  {'n':>4s}  acc")
-for op in OPS_EVAL:
-    for fmt in FORMATS:
-        for bin_name in BINS:
-            grp = [r for r in hold_per_op
-                   if r["op"] == op and r["fmt"] == fmt
-                   and r["bin"] == bin_name and r["variant"] == "compute"]
-            if not grp:
-                continue
-            acc = float(np.mean([r["correct"] for r in grp]))
-            acc_table[(op, fmt, bin_name)] = acc
-            print(f"  {op:4s}  {fmt:8s}  {bin_name:3s}  {len(grp):>4d}  {acc:.1%}")
+if MEASURE_ACCURACY:
+    import random as _rand
+    _rng = _random.Random(0)
+    _sample = []
+    for op in OPS_EVAL:
+        grp = [r for r in hold_per_op if r["op"] == op and r["variant"] == "compute"]
+        _rng.shuffle(grp)
+        _sample.extend(grp[:ACC_SAMPLE])
+    print(f"\nMeasuring accuracy on {len(_sample)} sampled H1 records ...")
+    measure_accuracy(_sample)
+    print(f"\n  {'op':4s}  {'fmt':8s}  {'bin':3s}  {'n':>4s}  acc")
+    for op in OPS_EVAL:
+        for fmt in FORMATS:
+            for bin_name in BINS:
+                grp = [r for r in _sample
+                       if r["op"] == op and r["fmt"] == fmt and r["bin"] == bin_name]
+                if not grp:
+                    continue
+                acc = float(np.mean([r["correct"] for r in grp]))
+                acc_table[(op, fmt, bin_name)] = acc
+                print(f"  {op:4s}  {fmt:8s}  {bin_name:3s}  {len(grp):>4d}  {acc:.1%}")
+else:
+    print("\n(Accuracy measurement skipped — set MEASURE_ACCURACY=True to enable)")
 
-# ── 6. Collect training activations ───────────────────────────────────────────
-print("\nCollecting training activations...")
-
-# Flat indexed list so we can slice by (op, fmt) later
+# ── 6. Collect activations at all layers in one pass ─────────────────────────
 train_recs: list[dict] = train_corpus
-print(f"  ctrl: {sum(1 for r in train_recs if r['op']=='ctrl')}  "
-      f"copy: {sum(1 for r in train_recs if r['op']=='copy')}  "
-      f"math: {sum(1 for r in train_recs if r['op'] not in ('ctrl','copy'))}")
-train_acts_raw = collect_acts(train_recs, desc="train")
+CKPT_ACTS = OUT_DIR / "acts_checkpoint.pt"
 
-n_nan = torch.isnan(train_acts_raw).sum().item()
-n_inf = torch.isinf(train_acts_raw).sum().item()
-if n_nan or n_inf:
-    print(f"  WARNING: {n_nan} NaN + {n_inf} Inf — replacing with 0")
-    train_acts_raw = torch.nan_to_num(train_acts_raw, nan=0.0, posinf=0.0, neginf=0.0)
+norm_by_layer: dict[int, torch.Tensor] = {}
+norm_stats:    dict[int, tuple]         = {}
 
-act_mean = train_acts_raw.mean(dim=0, keepdim=True)
-act_std  = train_acts_raw.std(dim=0,  keepdim=True).clamp(min=1e-6)
-train_acts = (train_acts_raw - act_mean) / act_std
-print(f"  {train_acts.shape}  mean={train_acts.mean():.4f}  std={train_acts.std():.4f}")
+if CKPT_ACTS.exists():
+    print(f"\nLoading cached activations from {CKPT_ACTS} ...")
+    ckpt = torch.load(CKPT_ACTS, weights_only=True)
+    for l in LAYERS:
+        norm_by_layer[l] = ckpt["norm"][l]
+        norm_stats[l]    = (ckpt["mu"][l], ckpt["sig"][l])
+        print(f"  Layer {l:2d}: {norm_by_layer[l].shape}")
+    for h in _hook_handles:
+        h.remove()
+    del model
+else:
+    print("\nCollecting activations (all layers in one inference pass)...")
+    print(f"  ctrl={sum(1 for r in train_recs if r['op']=='ctrl')}  "
+          f"copy={sum(1 for r in train_recs if r['op']=='copy')}  "
+          f"math={sum(1 for r in train_recs if r['op'] not in ('ctrl','copy'))}")
 
-del model
-if str(DEVICE) == "mps":
-    torch.mps.empty_cache()
+    raw_by_layer = collect_acts_all_layers(train_recs, desc="train (all layers)")
+    for h in _hook_handles:
+        h.remove()
 
-# ── 7. TopK SAE ───────────────────────────────────────────────────────────────
+    for l, raw in raw_by_layer.items():
+        raw = torch.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+        mu  = raw.mean(dim=0, keepdim=True)
+        sig = raw.std(dim=0,  keepdim=True).clamp(min=1e-6)
+        norm_by_layer[l] = (raw - mu) / sig
+        norm_stats[l]    = (mu, sig)
+        print(f"  Layer {l:2d}: {raw.shape}  mean={norm_by_layer[l].mean():.4f}  std={norm_by_layer[l].std():.4f}")
+
+    torch.save(dict(
+        norm={l: norm_by_layer[l] for l in LAYERS},
+        mu={l: norm_stats[l][0] for l in LAYERS},
+        sig={l: norm_stats[l][1] for l in LAYERS},
+    ), CKPT_ACTS)
+    print(f"  Activations saved → {CKPT_ACTS}")
+
+    del model
+    if str(DEVICE) == "mps":
+        torch.mps.empty_cache()
+
+# ── 7. TopK SAE (one per layer) ───────────────────────────────────────────────
 class TopKSAE(nn.Module):
     def __init__(self, d_in, d_sae, k):
         super().__init__()
@@ -205,349 +254,366 @@ class TopKSAE(nn.Module):
         acts.scatter_(-1, idx, vals.clamp(min=0))
         return acts
 
-    def decode(self, acts):
-        return acts @ self.W_dec + self.b_dec
-
-    def forward(self, x):
-        acts = self.encode(x)
-        return acts, self.decode(acts)
+    def decode(self, acts): return acts @ self.W_dec + self.b_dec
+    def forward(self, x):   acts = self.encode(x); return acts, self.decode(acts)
 
     @torch.no_grad()
     def normalise_decoder(self):
         self.W_dec.data = nn.functional.normalize(self.W_dec.data, dim=1)
 
-sae = TopKSAE(D_MODEL, D_SAE, SAE_K)
-print(f"\nSAE: d_sae={D_SAE}  k={SAE_K}  params={sum(p.numel() for p in sae.parameters()):,}")
+def train_sae(train_acts: torch.Tensor, layer_idx: int) -> tuple[TopKSAE, list, float, int]:
+    """Train one SAE; return (sae, history, var_expl, n_live)."""
+    sae       = TopKSAE(D_MODEL, D_SAE, SAE_K)
+    optimizer = torch.optim.Adam(sae.parameters(), lr=SAE_LR)
+    loader    = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(train_acts), batch_size=SAE_BATCH, shuffle=True)
+    feat_usage = torch.zeros(D_SAE)
+    history    = []
+    step       = 0
 
-# ── 8. Train SAE ──────────────────────────────────────────────────────────────
-optimizer   = torch.optim.Adam(sae.parameters(), lr=SAE_LR)
-loader      = torch.utils.data.DataLoader(
-    torch.utils.data.TensorDataset(train_acts), batch_size=SAE_BATCH, shuffle=True,
-)
-feat_usage  = torch.zeros(D_SAE)
-history     = []
-step        = 0
+    for epoch in range(SAE_EPOCHS):
+        e_mse = 0.0
+        for (x,) in loader:
+            lr = SAE_LR * min(1.0, step / max(1, WARMUP_STEPS))
+            for pg in optimizer.param_groups: pg["lr"] = lr
+            step += 1
+            acts, x_hat = sae(x)
+            with torch.no_grad():
+                feat_usage = 0.99 * feat_usage + 0.01 * (acts > 0).float().mean(0)
+            mse  = (x - x_hat).pow(2).mean()
+            dead = (feat_usage < DEAD_THR).float()
+            aux  = ((x - x_hat).detach() - (acts * dead) @ sae.W_dec).pow(2).mean() \
+                   if dead.sum() > 0 else torch.tensor(0.0)
+            optimizer.zero_grad()
+            (mse + AUX_W * aux).backward()
+            nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
+            optimizer.step(); sae.normalise_decoder()
+            e_mse += mse.item()
+        n_dead   = (feat_usage < DEAD_THR).sum().item()
+        mean_mse = e_mse / len(loader)
+        if not torch.isfinite(torch.tensor(mean_mse)):
+            print(f"    L{layer_idx} epoch {epoch+1}: NaN — stopping"); break
+        history.append(dict(epoch=epoch+1, mse=mean_mse, dead=n_dead))
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"    L{layer_idx}  ep {epoch+1:2d}/{SAE_EPOCHS}  mse={mean_mse:.5f}  dead={n_dead}/{D_SAE}")
 
-print("\nTraining SAE...")
-for epoch in range(SAE_EPOCHS):
-    e_mse = 0.0
-    for (x,) in loader:
-        lr = SAE_LR * min(1.0, step / max(1, WARMUP_STEPS))
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
-        step += 1
+    sae.eval()
+    with torch.no_grad():
+        s = train_acts[:1000]
+        var_expl = float(1 - (s - sae(s)[1]).pow(2).sum() / s.pow(2).sum())
+    n_live = int((feat_usage > DEAD_THR).sum())
+    return sae, history, var_expl, n_live
 
-        acts, x_hat = sae(x)
-        with torch.no_grad():
-            feat_usage = 0.99 * feat_usage + 0.01 * (acts > 0).float().mean(0)
-        mse  = (x - x_hat).pow(2).mean()
-        dead = (feat_usage < DEAD_THR).float()
-        aux  = ((x - x_hat).detach() - (acts * dead) @ sae.W_dec).pow(2).mean() \
-               if dead.sum() > 0 else torch.tensor(0.0)
-        optimizer.zero_grad()
-        (mse + AUX_W * aux).backward()
-        nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
-        optimizer.step()
-        sae.normalise_decoder()
-        e_mse += mse.item()
+# ── 8. Train SAE for each layer ───────────────────────────────────────────────
+saes:       dict[int, TopKSAE] = {}
+sae_stats:  dict[int, dict]    = {}
+CKPT_SAE = OUT_DIR / "sae_checkpoint.pt"
 
-    n_dead   = (feat_usage < DEAD_THR).sum().item()
-    mean_mse = e_mse / len(loader)
-    if not torch.isfinite(torch.tensor(mean_mse)):
-        print(f"  Epoch {epoch+1:2d}  NaN/Inf — stopping"); break
-    history.append(dict(epoch=epoch+1, mse=mean_mse, dead=n_dead))
-    if (epoch + 1) % 5 == 0 or epoch == 0:
-        print(f"  Epoch {epoch+1:2d}/{SAE_EPOCHS}  mse={mean_mse:.5f}  dead={n_dead}/{D_SAE}")
+if CKPT_SAE.exists():
+    print(f"\nLoading cached SAEs from {CKPT_SAE} ...")
+    ckpt_sae = torch.load(CKPT_SAE, weights_only=False)
+    for l in LAYERS:
+        sae = TopKSAE(D_MODEL, D_SAE, SAE_K)
+        sae.load_state_dict(ckpt_sae["state_dicts"][l])
+        sae.eval()
+        saes[l]      = sae
+        sae_stats[l] = ckpt_sae["stats"][l]
+        print(f"  Layer {l}: var_expl={sae_stats[l]['var_expl']:.2%}  live={sae_stats[l]['n_live']}")
+else:
+    print(f"\nTraining SAEs for layers {LAYERS}  (d_sae={D_SAE}  k={SAE_K}  epochs={SAE_EPOCHS})")
+    for l in LAYERS:
+        print(f"\n  ── Layer {l} ──")
+        sae, history, var_expl, n_live = train_sae(norm_by_layer[l], l)
+        saes[l]      = sae
+        sae_stats[l] = dict(layer=l, history=history, var_expl=var_expl, n_live=n_live)
+        print(f"    Layer {l}: var_expl={var_expl:.2%}  live={n_live}/{D_SAE}")
+    torch.save(dict(
+        state_dicts={l: saes[l].state_dict() for l in LAYERS},
+        stats=sae_stats,
+    ), CKPT_SAE)
+    print(f"  SAEs saved → {CKPT_SAE}")
 
-sae.eval()
-with torch.no_grad():
-    s = train_acts[:1000]
-    var_expl = 1 - (s - sae(s)[1]).pow(2).sum() / s.pow(2).sum()
-n_live = (feat_usage > DEAD_THR).sum().item()
-print(f"  Variance explained: {var_expl.item():.2%}  Live: {n_live}/{D_SAE}")
+# Training curves (one row per layer)
+fig, axes = plt.subplots(len(LAYERS), 2, figsize=(10, 3 * len(LAYERS)), squeeze=False)
+for row, l in enumerate(LAYERS):
+    hist = sae_stats[l]["history"]
+    eps  = [h["epoch"] for h in hist]
+    axes[row, 0].plot(eps, [h["mse"]  for h in hist], marker="o", ms=2)
+    axes[row, 0].set(title=f"Layer {l} — MSE", xlabel="Epoch")
+    axes[row, 1].plot(eps, [h["dead"] for h in hist], marker="o", ms=2, color="tomato")
+    axes[row, 1].set(title=f"Layer {l} — Dead/{D_SAE}", xlabel="Epoch")
+plt.tight_layout()
+plt.savefig(OUT_DIR / "sae_training_all_layers.png", dpi=120)
+plt.close()
 
-fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 4))
-a1.plot([h["epoch"] for h in history], [h["mse"] for h in history], marker="o")
-a1.set(title="SAE MSE", xlabel="Epoch")
-a2.plot([h["epoch"] for h in history], [h["dead"] for h in history], marker="o", color="tomato")
-a2.set(title=f"Dead features (/{D_SAE})", xlabel="Epoch")
-plt.tight_layout(); plt.savefig(OUT_DIR / "sae_training.png", dpi=150); plt.close()
-
-# ── 9. SAE feature extraction ─────────────────────────────────────────────────
+# ── 9. Feature extraction helpers ─────────────────────────────────────────────
 @torch.no_grad()
-def to_features(acts_tensor: torch.Tensor) -> np.ndarray:
+def to_features(sae: TopKSAE, acts_tensor: torch.Tensor) -> np.ndarray:
     return np.concatenate([
         sae.encode(acts_tensor[i:i+512]).numpy()
         for i in range(0, len(acts_tensor), 512)
     ], axis=0)
 
-# Encode entire training corpus once; slice later by (op, fmt)
-all_feats_np = np.nan_to_num(to_features(train_acts), nan=0.0)  # (N, D_SAE)
-
-def get_feat_slice(op=None, fmt=None) -> np.ndarray:
-    """Return SAE features for records matching (op, fmt) filter."""
+def get_feat_slice(feats_np, op=None, fmt=None) -> np.ndarray:
     mask = np.ones(len(train_recs), dtype=bool)
     if op  is not None: mask &= np.array([r["op"]  == op  for r in train_recs])
     if fmt is not None: mask &= np.array([r["fmt"] == fmt for r in train_recs])
-    return all_feats_np[mask]
+    return feats_np[mask]
 
-# ── 10. Fingerprint analysis (reusable) ───────────────────────────────────────
+# ── 10. Fingerprint analysis helpers ─────────────────────────────────────────
 def cosine(a, b):
     na, nb = norm(a), norm(b)
     return float(np.dot(a, b) / (na * nb)) if na > 1e-8 and nb > 1e-8 else 0.0
 
 def compute_fingerprints(feats_by_op: dict) -> tuple[dict, dict]:
-    """
-    feats_by_op: {op: np.ndarray (N, D_SAE)}
-    Returns (fingerprints, effect_sizes) dicts.
-    Baseline = 'ctrl' (neutral non-math text).
-    'copy' is a labelled condition, not the baseline — it sits in feature space
-    alongside the ops and is used separately for cheat proximity scoring.
-    """
+    """Baseline = ctrl (neutral non-math text)."""
+    if "ctrl" not in feats_by_op or len(feats_by_op["ctrl"]) == 0:
+        return {}, {}
     base_mean = feats_by_op["ctrl"].mean(axis=0)
     base_std  = feats_by_op["ctrl"].std(axis=0) + 1e-8
-    fingerprints, effect_sizes = {}, {}
+    fps, effs = {}, {}
     for op in OPS_EVAL:
-        if op not in feats_by_op or len(feats_by_op[op]) == 0:
-            continue
+        if op not in feats_by_op or len(feats_by_op[op]) == 0: continue
         op_mean = feats_by_op[op].mean(axis=0)
         pooled  = np.sqrt((base_std**2 + feats_by_op[op].std(axis=0)**2 + 1e-8) / 2)
         d = (op_mean - base_mean) / pooled
-        effect_sizes[op] = d
-        fingerprints[op] = d > FP_THRESHOLD
-    return fingerprints, effect_sizes
+        effs[op] = d; fps[op] = d > FP_THRESHOLD
+    return fps, effs
 
 def containment(fp_a, fp_b):
     return float((fp_a & fp_b).sum()) / (fp_a.sum() + 1e-8)
 
-def compute_rdm(f, n=200, seed=0):
-    np.random.seed(seed)
-    sub = f[np.random.choice(len(f), min(n, len(f)), replace=False)]
-    nrm = norm(sub, axis=1, keepdims=True).clip(min=1e-8)
-    sim = (sub / nrm) @ (sub / nrm).T
-    return np.nan_to_num(1 - sim, nan=1.0)
+def jaccard(fps_by_fmt: list) -> float:
+    if not fps_by_fmt: return 0.0
+    union = np.array(fps_by_fmt).any(axis=0)
+    inter = np.array(fps_by_fmt).all(axis=0)
+    return float(inter.sum()) / (union.sum() + 1e-8)
 
-def rdm_corr(a, b):
-    idx = np.triu_indices(len(a), k=1)
-    rho, _ = spearmanr(a[idx], b[idx])
-    return rho
+# ── 11. Per-layer analysis ────────────────────────────────────────────────────
+layer_results: dict[int, dict] = {}
 
-def run_analysis(label: str, feats_by_op: dict) -> dict:
-    """Run fingerprint + containment + RSA for a given feature slice."""
-    fps, effs = compute_fingerprints(feats_by_op)
-    if not fps:
-        return {}
+print("\nRunning fingerprint analysis per layer …")
+for l in LAYERS:
+    sae     = saes[l]
+    acts    = norm_by_layer[l]
+    feats_np = np.nan_to_num(to_features(sae, acts), nan=0.0)
 
-    print(f"\n{'─'*55}")
-    print(f"  Analysis: {label}")
-    print(f"{'─'*55}")
+    # Build feature dicts for all formats and per-format
+    feats_all = {op: get_feat_slice(feats_np, op=op) for op in OPS_EVAL}
+    feats_all["copy"] = get_feat_slice(feats_np, op="copy")
+    feats_all["ctrl"] = get_feat_slice(feats_np, op="ctrl")
 
-    # Fingerprint sizes
-    print(f"  Fingerprints (Cohen's d > {FP_THRESHOLD}):")
+    feats_by_fmt = {}
+    for fmt in FORMATS:
+        fd = {op: get_feat_slice(feats_np, op=op, fmt=fmt) for op in OPS_EVAL}
+        fd["copy"] = get_feat_slice(feats_np, op="copy", fmt=fmt)
+        fd["ctrl"] = feats_all["ctrl"]   # ctrl has no fmt tag
+        feats_by_fmt[fmt] = fd
+
+    fps_all, _   = compute_fingerprints(feats_all)
+    fps_by_fmt   = {fmt: compute_fingerprints(feats_by_fmt[fmt])[0] for fmt in FORMATS}
+
+    # Jaccard across formats per op
+    jaccards = {}
     for op in OPS_EVAL:
-        n = fps.get(op, np.zeros(D_SAE, dtype=bool)).sum()
-        print(f"    {op}: {n} features")
+        fps_list = [fps_by_fmt[f].get(op, np.zeros(D_SAE, bool)) for f in FORMATS]
+        jaccards[op] = jaccard(fps_list)
 
-    # Containment matrix
-    print(f"  Containment [row ⊆ col]:")
-    print(f"    {'':5}", "  ".join(f"{o:>6}" for o in OPS_EVAL if o in fps))
-    for a in OPS_EVAL:
-        if a not in fps: continue
-        row = "  ".join(f"{containment(fps[a], fps[b]):>6.3f}"
-                        for b in OPS_EVAL if b in fps)
-        print(f"    {a:5}  {row}")
+    # AUC
+    X = np.concatenate([feats_all[op] for op in OPS_EVAL if len(feats_all.get(op, [])) >= 10]
+                       + [feats_all["ctrl"]])
+    ops_p = [op for op in OPS_EVAL if len(feats_all.get(op, [])) >= 10]
+    y = np.array([1]*sum(len(feats_all[op]) for op in ops_p) + [0]*len(feats_all["ctrl"]))
+    auc_mean = auc_std = float("nan")
+    if len(ops_p) and len(feats_all["ctrl"]) >= 10:
+        aucs = cross_val_score(LogisticRegression(max_iter=500, C=0.1),
+                               X, y, cv=min(5, int(y.sum())), scoring="roc_auc")
+        auc_mean, auc_std = float(aucs.mean()), float(aucs.std())
 
-    c_am = containment(fps.get("add", np.zeros(D_SAE, bool)),
-                       fps.get("mul", np.zeros(D_SAE, bool)))
-    c_ma = containment(fps.get("mul", np.zeros(D_SAE, bool)),
-                       fps.get("add", np.zeros(D_SAE, bool)))
-    verdict = "SUPPORTED" if c_am > c_ma else "NOT SUPPORTED"
-    shared  = int(np.array([fps[o] for o in OPS_EVAL if o in fps]).all(axis=0).sum())
-    print(f"  Hierarchy (add⊆mul={c_am:.3f} mul⊆add={c_ma:.3f}): {verdict}")
-    print(f"  Shared math core (all ops): {shared} features")
-
-    # RSA
-    rdms = {op: compute_rdm(feats_by_op[op])
-            for op in OPS_EVAL + ["copy", "ctrl"] if op in feats_by_op and len(feats_by_op[op]) >= 10}
-    if len(rdms) >= 2:
-        print(f"  RDM (Spearman ρ):")
-        rdm_ops = list(rdms.keys())
-        print(f"    {'':6}", "  ".join(f"{o:>6}" for o in rdm_ops))
-        for a in rdm_ops:
-            row = "  ".join(f"{rdm_corr(rdms[a], rdms[b]):>6.3f}" for b in rdm_ops)
-            print(f"    {a:6}  {row}")
-
-    return dict(
-        label=label,
-        fingerprint_sizes={op: int(fps.get(op, np.zeros(D_SAE, bool)).sum()) for op in OPS_EVAL},
-        shared_core=shared,
-        containment_add_mul=float(c_am), containment_mul_add=float(c_ma),
-        hierarchy_verdict=verdict,
+    layer_results[l] = dict(
+        var_expl   = sae_stats[l]["var_expl"],
+        n_live     = sae_stats[l]["n_live"],
+        fp_sizes   = {op: int(fps_all.get(op, np.zeros(D_SAE, bool)).sum()) for op in OPS_EVAL},
+        jaccards   = jaccards,
+        auc        = auc_mean,
+        feats_all  = feats_all,
+        fps_all    = fps_all,
+        fps_by_fmt = fps_by_fmt,
+        feats_by_fmt = feats_by_fmt,
     )
+    fp_str = "  ".join(f"{op}={layer_results[l]['fp_sizes'][op]}" for op in OPS_EVAL)
+    print(f"  Layer {l:2d}: var={sae_stats[l]['var_expl']:.1%}  live={sae_stats[l]['n_live']}  "
+          f"AUC={auc_mean:.3f}  fps=[{fp_str}]")
 
-# ── 11. Run analysis: all formats + per-format ───────────────────────────────
-analysis_results = []
+# ── 12. Layer sweep visualisations ────────────────────────────────────────────
+COLORS = {"add":"steelblue","sub":"seagreen","mul":"darkorange",
+          "div":"mediumpurple","copy":"tomato","ctrl":"gray"}
 
-# ── All formats combined ──────────────────────────────────────────────────────
-feats_all = {op: get_feat_slice(op=op) for op in OPS_EVAL}
-feats_all["copy"] = get_feat_slice(op="copy")
-feats_all["ctrl"] = get_feat_slice(op="ctrl")
-r = run_analysis("ALL FORMATS", feats_all)
-analysis_results.append(r)
+# (a) Fingerprint size per layer × op — heatmap + line plot
+fp_matrix = np.array([[layer_results[l]["fp_sizes"].get(op, 0)
+                        for op in OPS_EVAL] for l in LAYERS])  # (n_layers, n_ops)
 
-# Save fingerprints from combined analysis for later holdout scoring
-fps_combined, effs_combined = compute_fingerprints(feats_all)
+fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+sns_ax = axes[0]
+import seaborn as sns
+sns.heatmap(fp_matrix.T, annot=True, fmt="d", ax=sns_ax, cmap="YlOrRd",
+            xticklabels=[f"L{l}" for l in LAYERS], yticklabels=OPS_EVAL, linewidths=0.5)
+sns_ax.set_title("Fingerprint features per layer × op", fontweight="bold")
+sns_ax.set_xlabel("Layer"); sns_ax.set_ylabel("Operation")
 
-# ── Per-format ────────────────────────────────────────────────────────────────
-feats_by_fmt = {}  # fmt → {op → np.ndarray}
-for fmt in FORMATS:
-    fd = {op: get_feat_slice(op=op, fmt=fmt) for op in OPS_EVAL}
-    fd["copy"] = get_feat_slice(op="copy", fmt=fmt)
-    fd["ctrl"] = get_feat_slice(op="ctrl")   # ctrl has no fmt tag; share across slices
-    feats_by_fmt[fmt] = fd
-    if all(len(v) >= 10 for v in fd.values()):
-        r = run_analysis(f"FORMAT: {fmt.upper()}", fd)
-    else:
-        print(f"\n  (skipping {fmt} — insufficient data)")
-        r = {"label": fmt}
-    analysis_results.append(r)
+ax2 = axes[1]
+for k, op in enumerate(OPS_EVAL):
+    ax2.plot(LAYERS, fp_matrix[:, k], marker="o", label=op, color=list(COLORS.values())[k])
+ax2.set_xlabel("Layer"); ax2.set_ylabel("# fingerprint features")
+ax2.set_title("Fingerprint size across layers"); ax2.legend(); ax2.set_xticks(LAYERS)
+plt.tight_layout()
+plt.savefig(OUT_DIR / "layer_sweep_fingerprints.png", dpi=150)
+plt.close()
 
-# ── 12. Format-invariance summary ─────────────────────────────────────────────
-print(f"\n{'═'*55}")
-print("  FORMAT INVARIANCE — fingerprint size comparison")
-print(f"{'═'*55}")
-print(f"  {'op':4s}  {'all':>6s}", "  ".join(f"{f:>8s}" for f in FORMATS))
+# (b) AUC, variance explained, live features across layers
+fig, axes = plt.subplots(1, 3, figsize=(13, 3.5))
+layer_labels = [f"L{l}" for l in LAYERS]
+axes[0].plot(LAYERS, [layer_results[l]["auc"]      for l in LAYERS], marker="o", color="steelblue")
+axes[0].set(title="Linear AUC (math vs ctrl)", xlabel="Layer", ylabel="AUC", ylim=(0,1)); axes[0].set_xticks(LAYERS)
+axes[1].plot(LAYERS, [layer_results[l]["var_expl"] for l in LAYERS], marker="o", color="seagreen")
+axes[1].set(title="Variance explained", xlabel="Layer", ylabel="var_expl"); axes[1].set_xticks(LAYERS)
+axes[2].plot(LAYERS, [layer_results[l]["n_live"]   for l in LAYERS], marker="o", color="darkorange")
+axes[2].axhline(D_SAE, ls="--", color="gray", alpha=0.4); axes[2].set_xticks(LAYERS)
+axes[2].set(title=f"Live features (/{D_SAE})", xlabel="Layer", ylabel="n_live")
+plt.suptitle(f"Layer sweep — {MODEL_NAME}", y=1.02)
+plt.tight_layout()
+plt.savefig(OUT_DIR / "layer_sweep_metrics.png", dpi=150)
+plt.close()
+
+# (c) Jaccard (format invariance) across layers
+fig, ax = plt.subplots(figsize=(9, 3.5))
+for k, op in enumerate(OPS_EVAL):
+    ax.plot(LAYERS, [layer_results[l]["jaccards"].get(op, 0) for l in LAYERS],
+            marker="o", label=op, color=list(COLORS.values())[k])
+ax.set_xlabel("Layer"); ax.set_ylabel("Jaccard (format invariance)"); ax.set_ylim(0, 1)
+ax.set_title("Format invariance of fingerprints across layers"); ax.legend(); ax.set_xticks(LAYERS)
+ax.axhline(0.5, ls="--", color="gray", alpha=0.4)
+plt.tight_layout()
+plt.savefig(OUT_DIR / "layer_sweep_jaccard.png", dpi=150)
+plt.close()
+print(f"\nLayer sweep plots → {OUT_DIR}/layer_sweep_*.png")
+
+# Pick best layer for detailed analysis (highest mean fingerprint size)
+best_layer = max(LAYERS, key=lambda l: np.mean(list(layer_results[l]["fp_sizes"].values())))
+print(f"\nBest layer for fingerprints: {best_layer}  "
+      f"(fp_sizes={layer_results[best_layer]['fp_sizes']})")
+
+# ── 13. Detailed analysis on best layer ──────────────────────────────────────
+print(f"\nDetailed analysis on layer {best_layer} …")
+feats_all    = layer_results[best_layer]["feats_all"]
+fps_combined = layer_results[best_layer]["fps_all"]
+feats_by_fmt = layer_results[best_layer]["feats_by_fmt"]
+fps_by_fmt   = layer_results[best_layer]["fps_by_fmt"]
+
+# Format invariance summary
+print(f"\n  FORMAT INVARIANCE (layer {best_layer}):")
+print(f"  {'op':4s}  {'all':>6s}", "  ".join(f"{f:>9s}" for f in FORMATS))
 for op in OPS_EVAL:
     n_all  = int(fps_combined.get(op, np.zeros(D_SAE, bool)).sum())
-    by_fmt = []
-    for fmt in FORMATS:
-        fps_f, _ = compute_fingerprints(feats_by_fmt[fmt])
-        by_fmt.append(int(fps_f.get(op, np.zeros(D_SAE, bool)).sum()))
-    print(f"  {op:4s}  {n_all:>6d}", "  ".join(f"{n:>8d}" for n in by_fmt))
+    by_fmt = [int(fps_by_fmt[f].get(op, np.zeros(D_SAE, bool)).sum()) for f in FORMATS]
+    j      = layer_results[best_layer]["jaccards"].get(op, 0)
+    print(f"  {op:4s}  {n_all:>6d}", "  ".join(f"{n:>9d}" for n in by_fmt),
+          f"  Jaccard={j:.3f}")
 
-# Jaccard overlap of fingerprints across formats (per op)
-print(f"\n  Fingerprint overlap (Jaccard) across formats:")
-for op in OPS_EVAL:
-    fps_fmt = []
-    for fmt in FORMATS:
-        fps_f, _ = compute_fingerprints(feats_by_fmt[fmt])
-        fps_fmt.append(fps_f.get(op, np.zeros(D_SAE, bool)))
-    if not any(f.sum() > 0 for f in fps_fmt):
-        continue
-    union = np.array(fps_fmt).any(axis=0)
-    inter = np.array(fps_fmt).all(axis=0)
-    jaccard = float(inter.sum()) / (union.sum() + 1e-8)
-    print(f"  {op}: intersection={inter.sum()}  union={union.sum()}  Jaccard={jaccard:.3f}")
-
-# ── 13. Linear classification per format ─────────────────────────────────────
-print(f"\n  Linear AUC (math vs copy) per format slice:")
-for label, fd in [("all", feats_all)] + [(f, feats_by_fmt[f]) for f in FORMATS]:
-    ops_present = [op for op in OPS_EVAL if op in fd and len(fd[op]) >= 10]
-    ctrl_present = "ctrl" in fd and len(fd["ctrl"]) >= 10
-    if not ops_present or not ctrl_present:
-        continue
-    # AUC: math ops vs neutral ctrl (the natural "is math happening?" classifier)
-    X = np.concatenate([fd[op] for op in ops_present] + [fd["ctrl"]])
-    y = np.array([1] * sum(len(fd[op]) for op in ops_present) + [0] * len(fd["ctrl"]))
-    if len(np.unique(y)) < 2 or X.shape[0] < 20:
-        continue
-    aucs = cross_val_score(LogisticRegression(max_iter=500, C=0.1),
-                           X, y, cv=min(5, int(y.sum())), scoring="roc_auc")
-    print(f"  {label:8s}  AUC={aucs.mean():.3f} ± {aucs.std():.3f}")
-
-# ── 14. PCA: all ops, coloured by op; faceted by format ──────────────────────
-fig, axes = plt.subplots(1, len(FORMATS) + 1, figsize=(5 * (len(FORMATS) + 1), 5))
-COLORS = {"add": "steelblue", "sub": "green", "mul": "darkorange",
-          "div": "purple", "copy": "tomato", "ctrl": "gray"}
+# PCA — all formats + per format
+import seaborn as sns
 SUB = 200
+fig, axes_pca = plt.subplots(1, len(FORMATS) + 1, figsize=(5*(len(FORMATS)+1), 4.5))
 
 def pca_plot(ax, fd, title):
-    ops_p = [op for op in OPS_EVAL + ["copy", "ctrl"] if op in fd and len(fd[op]) >= 5]
-    sub_f = {op: fd[op][np.random.choice(len(fd[op]), min(SUB, len(fd[op])), replace=False)]
+    ops_p = [op for op in OPS_EVAL + ["copy","ctrl"] if op in fd and len(fd[op]) >= 5]
+    sub_f = {op: fd[op][np.random.choice(len(fd[op]), min(SUB,len(fd[op])), replace=False)]
              for op in ops_p}
     X = np.nan_to_num(np.concatenate(list(sub_f.values())), nan=0.0)
-    lbls = sum([[op] * len(sub_f[op]) for op in ops_p], [])
-    if X.shape[0] < 5:
-        ax.set_title(title + " (no data)"); return
+    lbls = sum([[op]*len(sub_f[op]) for op in ops_p], [])
+    if X.shape[0] < 5: ax.set_title(title + " (no data)"); return
     pcs = PCA(n_components=2).fit_transform(StandardScaler().fit_transform(X))
     for op in ops_p:
         m = np.array(lbls) == op
-        ax.scatter(pcs[m, 0], pcs[m, 1], c=COLORS[op], alpha=0.4, s=10, label=op)
+        ax.scatter(pcs[m,0], pcs[m,1], c=COLORS.get(op,"k"), alpha=0.4, s=10, label=op)
     ax.legend(fontsize=7); ax.set_title(title, fontsize=9)
 
 np.random.seed(0)
-pca_plot(axes[0], feats_all, "All formats")
+pca_plot(axes_pca[0], feats_all, f"All formats  (L{best_layer})")
 for i, fmt in enumerate(FORMATS):
-    pca_plot(axes[i + 1], feats_by_fmt[fmt], fmt.capitalize())
+    pca_plot(axes_pca[i+1], feats_by_fmt[fmt], fmt.capitalize())
 plt.tight_layout()
-plt.savefig(OUT_DIR / "pca_by_format.png", dpi=150)
+plt.savefig(OUT_DIR / "pca_best_layer.png", dpi=150)
 plt.close()
-print(f"\nPCA plot → {OUT_DIR}/pca_by_format.png")
 
-# ── 15. H2: Cheat holdout (reload model) ────────────────────────────────────
-print("\nH2: Cheat holdout — collecting activations (reloading model)...")
+# ── 14. H2: Cheat holdout on best layer ──────────────────────────────────────
+print(f"\nH2: Cheat holdout (layer {best_layer}) — reloading model …")
 model2 = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.float32)
 model2.eval().to(DEVICE)
-_buf.clear()
-hook2 = model2.model.layers[LAYER].register_forward_pre_hook(_pre_hook)
+cheat_layer_buf: list[torch.Tensor] = []
 
-cheat_sample = {op: [r for r in hold_cheat if r["op"] == op][:300] for op in OPS_EVAL}
-cheat_feats_by_op: dict[str, dict[str, np.ndarray]] = {"all": {}, **{f: {} for f in FORMATS}}
+def _cheat_hook(module, args):
+    hidden = args[0] if isinstance(args[0], torch.Tensor) else args[0][0]
+    cheat_layer_buf.append(hidden[:,-1,:].detach().float().cpu())
 
-for op, recs in cheat_sample.items():
-    if not recs:
-        continue
-    acts = collect_acts(recs, desc=f"cheat/{op}")
+cheat_hook = model2.model.layers[best_layer].register_forward_pre_hook(_cheat_hook)
+mu, sig    = norm_stats[best_layer]
+best_sae   = saes[best_layer]
+
+cheat_feats: dict[str, np.ndarray] = {}
+for op in OPS_EVAL:
+    recs = [r for r in hold_cheat if r["op"] == op][:300]
+    if not recs: continue
+    cheat_layer_buf.clear()
+    for rec in tqdm(recs, desc=f"cheat/{op}", leave=False):
+        inp = tokenizer(rec["prompt"], return_tensors="pt").to(DEVICE)
+        model2(**inp)
+    acts = torch.cat(cheat_layer_buf, dim=0)
     acts = torch.nan_to_num(acts, nan=0.0)
-    acts = (acts - act_mean) / act_std
-    f_all = np.nan_to_num(to_features(acts), nan=0.0)
-    cheat_feats_by_op["all"][op] = f_all
-    for fmt in FORMATS:
-        idx = [i for i, r in enumerate(recs) if r["fmt"] == fmt]
-        cheat_feats_by_op[fmt][op] = f_all[idx] if idx else np.zeros((0, D_SAE))
+    acts = (acts - mu) / sig
+    cheat_feats[op] = np.nan_to_num(to_features(best_sae, acts), nan=0.0)
 
-hook2.remove()
-del model2
-if str(DEVICE) == "mps":
-    torch.mps.empty_cache()
+cheat_hook.remove(); del model2
+if str(DEVICE) == "mps": torch.mps.empty_cache()
 
-# Compare cheat vs compute centroid per (op, fmt-slice)
-print("\n  Cheat fingerprint similarity (cosine) to compute / copy centroids:")
-print(f"  {'slice':10s}  {'op':4s}  comp_sim  copy_sim  verdict")
 copy_centroid = feats_all["copy"].mean(axis=0)
+print(f"\n  {'op':5s}  {'→compute':>10s}  {'→copy':>8s}  verdict")
+for op in OPS_EVAL:
+    if op not in cheat_feats: continue
+    cc = cheat_feats[op].mean(axis=0); comp_c = feats_all[op].mean(axis=0)
+    cs = cosine(cc, comp_c); ks = cosine(cc, copy_centroid)
+    print(f"  {op:5s}  {cs:>10.4f}  {ks:>8.4f}  {'→copy' if ks>cs else '→compute'}")
 
-for slice_label, cheat_fd, ref_fd in (
-    [("all",  cheat_feats_by_op["all"],  feats_all)] +
-    [(f,      cheat_feats_by_op[f],      feats_by_fmt[f]) for f in FORMATS]
-):
-    for op in OPS_EVAL:
-        c_feats = cheat_fd.get(op)
-        if c_feats is None or len(c_feats) == 0:
-            continue
-        cheat_c  = c_feats.mean(axis=0)
-        comp_c   = ref_fd[op].mean(axis=0) if op in ref_fd and len(ref_fd[op]) else cheat_c
-        comp_sim = cosine(cheat_c, comp_c)
-        copy_sim = cosine(cheat_c, copy_centroid)
-        v = "→copy" if copy_sim > comp_sim else "→compute"
-        print(f"  {slice_label:10s}  {op:4s}  {comp_sim:>8.4f}  {copy_sim:>8.4f}  {v}")
-
-# ── 16. Summary ───────────────────────────────────────────────────────────────
+# ── 15. Summary ───────────────────────────────────────────────────────────────
 print("\n" + "=" * 65)
 print("SUMMARY")
 print("=" * 65)
-print(f"  Model:              {MODEL_NAME}  layer {LAYER}")
-print(f"  Training examples:  {len(train_acts)}")
-print(f"  SAE:                d_sae={D_SAE}  k={SAE_K}  epochs={SAE_EPOCHS}")
-print(f"  Variance explained: {var_expl.item():.2%}  Live: {n_live}/{D_SAE}")
-for op in OPS_EVAL:
-    n = int(fps_combined.get(op, np.zeros(D_SAE, bool)).sum())
-    print(f"  Fingerprint {op}:     {n} features")
+print(f"  Model:       {MODEL_NAME}")
+print(f"  Layers swept:{LAYERS}")
+print(f"  Best layer:  {best_layer}")
+print(f"  Train rows:  {len(train_recs)}")
+print(f"  SAE:         d_sae={D_SAE}  k={SAE_K}  epochs={SAE_EPOCHS}")
+print()
+print(f"  {'Layer':>6}  {'var_expl':>9}  {'n_live':>7}  {'AUC':>6}  " +
+      "  ".join(f"{op:>5}" for op in OPS_EVAL))
+for l in LAYERS:
+    r = layer_results[l]
+    fp_str = "  ".join(f"{r['fp_sizes'].get(op,0):>5}" for op in OPS_EVAL)
+    marker = "  ◀ best" if l == best_layer else ""
+    print(f"  {l:>6}  {r['var_expl']:>9.1%}  {r['n_live']:>7}  {r['auc']:>6.3f}  {fp_str}{marker}")
 print("=" * 65)
 
 json.dump(dict(
-    model=MODEL_NAME, layer=LAYER, n_train=len(train_acts),
-    var_explained=float(var_expl.item()), n_live=n_live, d_sae=D_SAE,
-    analysis=analysis_results,
+    model=MODEL_NAME, layers=LAYERS, best_layer=best_layer,
+    n_train=len(train_recs), d_sae=D_SAE, k=SAE_K,
+    layer_results={str(l): dict(
+        var_expl=layer_results[l]["var_expl"],
+        n_live=layer_results[l]["n_live"],
+        auc=layer_results[l]["auc"],
+        fp_sizes=layer_results[l]["fp_sizes"],
+        jaccards=layer_results[l]["jaccards"],
+    ) for l in LAYERS},
     accuracy_table={str(k): v for k, v in acc_table.items()},
 ), open(OUT_DIR / "results.json", "w"), indent=2)
-print(f"Results → {OUT_DIR}/results.json  |  Plots → {OUT_DIR}/pca_by_format.png")
+print(f"Results → {OUT_DIR}/results.json")
+print(f"Plots   → {OUT_DIR}/layer_sweep_*.png  sae_training_all_layers.png  pca_best_layer.png")
