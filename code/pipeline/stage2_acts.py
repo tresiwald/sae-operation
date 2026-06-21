@@ -135,11 +135,19 @@ def main():
     # normalise per layer
     norm, mu_d, sig_d = {}, {}, {}
     for l in layers:
-        raw = torch.cat([raw_by_layer[l]], dim=0) if not isinstance(raw_by_layer[l], torch.Tensor) \
-              else raw_by_layer[l]
+        raw = raw_by_layer[l]  # already float32 from hook
+        nan_frac = raw.isnan().float().mean().item()
+        if nan_frac > 0:
+            print(f"  WARNING L{l:2d}: {nan_frac:.1%} NaN values in activations — "
+                  f"likely float16 instability under left-padding. Zeroing NaNs.")
         raw = torch.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         mu  = raw.mean(dim=0, keepdim=True)
-        sig = raw.std(dim=0,  keepdim=True).clamp(min=1e-6)
+        sig = raw.std(dim=0,  keepdim=True)
+        if sig.max().item() < 1e-6:
+            print(f"  ERROR  L{l:2d}: all activations are zero/constant after NaN removal — "
+                  f"this layer's SAE will be uninformative. "
+                  f"Try SAE_DEVICE=cpu or reduce batch size (SAE_ACT_BATCH).")
+        sig = sig.clamp(min=1e-6)
         norm[l]  = (raw - mu) / sig
         mu_d[l]  = mu
         sig_d[l] = sig

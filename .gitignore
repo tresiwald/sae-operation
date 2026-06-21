@@ -18,8 +18,8 @@ venv/
 models/
 model_cache/
 
-# Results & outputs (keep results.json but ignore large arrays)
-results/*.png
+# Results — track JSON + plots, ignore large binaries
+results/checkpoints/
 results/*.npy
 results/*.npz
 

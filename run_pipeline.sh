@@ -22,7 +22,7 @@ export PYTHONPATH="$PWD/code:${PYTHONPATH:-}"
 # export HF_TOKEN="hf_..."
 
 # ── flags ─────────────────────────────────────────────────────────────────────
-SKIP_DATA=0; SKIP_ACTS=0; SKIP_SAE=0; RUN_ACC=0
+SKIP_DATA=0; SKIP_ACTS=0; SKIP_SAE=0; RUN_ACC=0; SYNC=0
 
 for arg in "$@"; do
     case $arg in
@@ -30,6 +30,7 @@ for arg in "$@"; do
         --skip-acts)  SKIP_DATA=1; SKIP_ACTS=1 ;;
         --skip-sae)   SKIP_DATA=1; SKIP_ACTS=1; SKIP_SAE=1 ;;
         --accuracy)   RUN_ACC=1 ;;
+        --sync)       SYNC=1 ;;
     esac
 done
 
@@ -67,3 +68,5 @@ run_stage "04_analysis"  pipeline.stage4_analysis
 
 echo ""
 echo "Pipeline complete.  Logs in logs/  Results in results/"
+
+[ $SYNC -eq 1 ] && bash "$(dirname "$0")/sync_results.sh"
