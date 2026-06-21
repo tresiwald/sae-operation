@@ -6,6 +6,7 @@ Override any value via environment variables (all prefixed SAE_):
 
 import os
 from pathlib import Path
+from typing import List, Optional
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT    = Path(__file__).resolve().parents[2]
@@ -21,8 +22,8 @@ MODEL_NAME = os.getenv("SAE_MODEL_NAME", "google/gemma-3-1b-pt")
 # Layers to sweep.  Env var: comma-separated ints, e.g. "4,8,13,17,22,25"
 # None → sweep all layers (resolved after model is loaded).
 _layers_env = os.getenv("SAE_LAYERS", "4,8,13,17,22,25")
-LAYERS: list[int] | None = [int(x) for x in _layers_env.split(",") if x.strip()] \
-                            if _layers_env.lower() not in ("none", "all", "") else None
+LAYERS: Optional[List[int]] = [int(x) for x in _layers_env.split(",") if x.strip()] \
+                               if _layers_env.lower() not in ("none", "all", "") else None
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 N_PER_CELL   = int(os.getenv("SAE_N_PER_CELL",   "150"))
