@@ -18,6 +18,9 @@ mkdir -p logs
 source .venv/bin/activate
 export PYTHONPATH="$PWD/code:${PYTHONPATH:-}"
 
+# HuggingFace auth — set HF_TOKEN here or export it before calling this script
+# export HF_TOKEN="hf_..."
+
 # ── flags ─────────────────────────────────────────────────────────────────────
 SKIP_DATA=0; SKIP_ACTS=0; SKIP_SAE=0; RUN_ACC=0
 

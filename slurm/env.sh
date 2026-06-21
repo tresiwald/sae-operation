@@ -27,7 +27,8 @@ export PYTHONPATH="$PROJECT_ROOT/code:${PYTHONPATH:-}"
 # export SAE_DEVICE="cuda"            # force device (auto-detected if unset)
 # export SAE_MEASURE_ACCURACY=1       # enable stage5
 
-# HuggingFace cache (point to fast scratch if available)
-# export HF_HOME=/scratch/$USER/.cache/huggingface
+# HuggingFace
+# export HF_TOKEN="hf_..."                             # set your token here
+# export HF_HOME=/scratch/$USER/.cache/huggingface    # point to fast scratch if available
 
 echo "ENV  project=$PROJECT_ROOT  python=$(which python)  device=${SAE_DEVICE:-auto}"
