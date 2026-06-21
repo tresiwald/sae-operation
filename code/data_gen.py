@@ -397,6 +397,86 @@ def make_multi_op_holdout(
     return data
 
 
+# ── Matched-operand probes (Experiment 1: hard negatives) ─────────────────────
+_PROBE_SYM = {"add": "+", "sub": "-", "mul": "*", "div": "/", "nonsense": "#"}
+
+
+def make_matched_probes(n_per_bin: int = 100, seed: int = 123) -> list:
+    """
+    Matched-operand hard negatives: the SAME operand pair (a, b) is presented
+    under every operator, so the only thing that differs between an `add` probe
+    and a `mul` probe with the same `pair_id` is the operator token.
+
+    This controls for digit identity / length / position — if operation
+    fingerprints stay separable here, they encode the operation, not the digits.
+
+    Operand pairs are drawn from the same BINS the SAE was trained on, and are
+    constrained so that *every* real operation is valid on the pair (sub
+    non-negative, div exact), guaranteeing true operand matching across ops.
+
+    Returns records with keys:
+      op (add/sub/mul/div/nonsense), fmt='symbolic', bin, a, b, expected,
+      pair_id (links the same operands across operators), prompt
+    """
+    rng  = random.Random(seed)
+    data = []
+    pid  = 0
+    for bin_name in BINS:
+        lo, hi = BINS[bin_name]
+        made, attempts = 0, 0
+        while made < n_per_bin and attempts < n_per_bin * 100:
+            attempts += 1
+            a = rng.randint(lo, hi)
+            b = rng.randint(lo, hi)
+            if b == 0:
+                continue
+            if a < b:                          # keep subtraction non-negative
+                a, b = b, a
+            if not (a % b == 0 and a // b > 0):  # require exact division
+                continue
+            expected = {"add": a + b, "sub": a - b, "mul": a * b,
+                        "div": a // b, "nonsense": None}
+            for op, sym in _PROBE_SYM.items():
+                data.append(dict(op=op, variant="compute", fmt="symbolic",
+                                 bin=bin_name, a=a, b=b, expected=expected[op],
+                                 pair_id=pid, prompt=f"{a}{sym}{b}="))
+            pid  += 1
+            made += 1
+    rng.shuffle(data)
+    return data
+
+
+# ── Hard problems (Experiment 2: error mechanism) ─────────────────────────────
+def make_hard_problems(ops: list = None, bins: list = None,
+                       n_per_cell: int = 150, seed: int = 321) -> list:
+    """
+    Symbolic compute problems in larger operand bins where the model starts to
+    make mistakes — needed to get a mix of correct and wrong answers for the
+    error-mechanism analysis.
+
+    Defaults to mul/div at 3d-5d, which break earliest.
+    """
+    if ops  is None: ops  = ["mul", "div"]
+    if bins is None: bins = ["3d", "4d", "5d"]
+    rng  = random.Random(seed)
+    data = []
+    for op in ops:
+        for bin_name in bins:
+            made, attempts = 0, 0
+            while made < n_per_cell and attempts < n_per_cell * 50:
+                attempts += 1
+                pair = _sample_pair(op, bin_name, rng)
+                if pair is None:
+                    continue
+                a, b, c = pair
+                data.append(dict(op=op, variant="compute", fmt="symbolic",
+                                 bin=bin_name, a=a, b=b, expected=c,
+                                 prompt=f"{a}{_PROBE_SYM[op]}{b}="))
+                made += 1
+    rng.shuffle(data)
+    return data
+
+
 # ── Train / holdout split ─────────────────────────────────────────────────────
 def split_dataset(data: list[dict], holdout_frac: float = 0.2, seed: int = 0):
     """
