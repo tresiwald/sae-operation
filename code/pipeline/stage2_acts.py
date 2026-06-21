@@ -108,7 +108,12 @@ def main():
     print(f"Stage 2 — collecting activations for {len(train_corpus)} records …")
 
     DEVICE = get_device()
-    dtype  = torch.float16 if DEVICE.type == "cuda" else torch.float32
+    # bfloat16 matches Gemma-3's training dtype and avoids float16 overflow
+    # in deeper layers (float16 has ~65k max vs bfloat16/float32 ~3.4e38).
+    # Override with SAE_DTYPE=float16 or SAE_DTYPE=float32 if needed.
+    _dtype_env = os.getenv("SAE_DTYPE", "bfloat16" if DEVICE.type == "cuda" else "float32")
+    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16,
+             "float32": torch.float32}[_dtype_env]
     print(f"  model={MODEL_NAME}  device={DEVICE}  dtype={dtype}")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
