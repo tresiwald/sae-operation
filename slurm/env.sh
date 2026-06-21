@@ -25,7 +25,8 @@ export PYTHONPATH="$PROJECT_ROOT/code:${PYTHONPATH:-}"
 # export SAE_EPOCHS=30
 # export SAE_OUT_DIR="results"
 # export SAE_DEVICE="cuda"            # force device (auto-detected if unset)
-# export SAE_ACT_BATCH=8             # reduce if deeper layers produce NaN (float16 instability)
+# export SAE_DTYPE=bfloat16          # default on CUDA; use float32 if bfloat16 also NaNs
+# export SAE_ACT_BATCH=8             # reduce if deeper layers produce NaN
 # export SAE_MEASURE_ACCURACY=1       # enable stage5
 
 # HuggingFace

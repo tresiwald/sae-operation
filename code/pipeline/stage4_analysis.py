@@ -323,7 +323,10 @@ def main():
 
     # 11. Cheat holdout — reload model, hook best layer only
     DEVICE = get_device()
-    dtype  = torch.float16 if DEVICE.type == "cuda" else torch.float32
+    import os as _os
+    _dtype_env = _os.getenv("SAE_DTYPE", "bfloat16" if DEVICE.type == "cuda" else "float32")
+    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16,
+             "float32": torch.float32}[_dtype_env]
     print(f"\nLoading model for cheat holdout (layer {best_layer}) …")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model2    = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=dtype)
