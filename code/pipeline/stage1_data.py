@@ -21,7 +21,9 @@ def main():
     train, hold_per_op, hold_cheat = split_dataset(all_data, holdout_frac=HOLDOUT_FRAC)
     ctrl_data      = make_ctrl_data(N_CTRL)
     train_corpus   = [r for r in train if r["variant"] in ("compute", "copy")] + ctrl_data
-    hold_multi_compute, hold_multi_cheat = make_multi_op_holdout(n_per_cell=100, ops=OPS_EVAL)
+    hold_multi = make_multi_op_holdout(n_per_cell=100, ops=OPS_EVAL)
+    hold_multi_compute = [r for r in hold_multi if r["variant"] == "compute"]
+    hold_multi_cheat   = [r for r in hold_multi if r["variant"] == "cheat"]
 
     print(f"  Train corpus        : {len(train_corpus)}")
     print(f"  H1 per-op compute   : {len(hold_per_op)}")
