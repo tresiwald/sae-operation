@@ -401,7 +401,9 @@ def make_multi_op_holdout(
 _PROBE_SYM = {"add": "+", "sub": "-", "mul": "*", "div": "/", "nonsense": "#"}
 
 
-def make_matched_probes(n_per_bin: int = 100, seed: int = 123) -> list:
+def make_matched_probes(n_per_bin: int = 100, seed: int = 123,
+                        formats: list = None, include_nonsense: bool = True,
+                        bins: list = None) -> list:
     """
     Matched-operand hard negatives: the SAME operand pair (a, b) is presented
     under every operator, so the only thing that differs between an `add` probe
@@ -410,18 +412,30 @@ def make_matched_probes(n_per_bin: int = 100, seed: int = 123) -> list:
     This controls for digit identity / length / position — if operation
     fingerprints stay separable here, they encode the operation, not the digits.
 
-    Operand pairs are drawn from the same BINS the SAE was trained on, and are
-    constrained so that *every* real operation is valid on the pair (sub
-    non-negative, div exact), guaranteeing true operand matching across ops.
+    With `formats=["symbolic","mixed","verbal"]` the SAME operand pairs are also
+    rendered in each surface format (sharing `pair_id` across formats), which
+    lets a cross-format test ask whether the separability is the *operation* or
+    just the operator *token* (`+` vs `plus`).
+
+    Operand pairs are drawn from the given BINS (default: all), constrained so
+    that every real operation is valid on the pair (sub non-negative, div exact).
+    When verbal format is requested, bins are restricted to VERBAL_BINS so the
+    same pairs render cleanly in words.
 
     Returns records with keys:
-      op (add/sub/mul/div/nonsense), fmt='symbolic', bin, a, b, expected,
-      pair_id (links the same operands across operators), prompt
+      op (add/sub/mul/div[/nonsense]), variant='compute', fmt, bin, a, b,
+      expected, pair_id, prompt
     """
+    if formats is None:
+        formats = ["symbolic"]
+    if bins is None:
+        bins = list(VERBAL_BINS) if "verbal" in formats else list(BINS)
+
     rng  = random.Random(seed)
     data = []
     pid  = 0
-    for bin_name in BINS:
+    real_ops = ["add", "sub", "mul", "div"]
+    for bin_name in bins:
         lo, hi = BINS[bin_name]
         made, attempts = 0, 0
         while made < n_per_bin and attempts < n_per_bin * 100:
@@ -434,12 +448,22 @@ def make_matched_probes(n_per_bin: int = 100, seed: int = 123) -> list:
                 a, b = b, a
             if not (a % b == 0 and a // b > 0):  # require exact division
                 continue
-            expected = {"add": a + b, "sub": a - b, "mul": a * b,
-                        "div": a // b, "nonsense": None}
-            for op, sym in _PROBE_SYM.items():
-                data.append(dict(op=op, variant="compute", fmt="symbolic",
-                                 bin=bin_name, a=a, b=b, expected=expected[op],
-                                 pair_id=pid, prompt=f"{a}{sym}{b}="))
+            expected = {"add": a + b, "sub": a - b, "mul": a * b, "div": a // b}
+            for fmt in formats:
+                for op in real_ops:
+                    if fmt == "symbolic":
+                        prompt = f"{a}{_PROBE_SYM[op]}{b}="
+                    else:
+                        compute_t = dict((f, ct) for f, ct, _, _ in TEMPLATES[op])[fmt]
+                        prompt = _fill(compute_t, a, b, expected[op])
+                    data.append(dict(op=op, variant="compute", fmt=fmt,
+                                     bin=bin_name, a=a, b=b, expected=expected[op],
+                                     pair_id=pid, prompt=prompt))
+                # nonsense operator only makes sense symbolically
+                if include_nonsense and fmt == "symbolic":
+                    data.append(dict(op="nonsense", variant="compute", fmt="symbolic",
+                                     bin=bin_name, a=a, b=b, expected=None,
+                                     pair_id=pid, prompt=f"{a}#{b}="))
             pid  += 1
             made += 1
     rng.shuffle(data)

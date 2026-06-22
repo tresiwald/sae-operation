@@ -16,7 +16,7 @@ source .venv/bin/activate
 export PYTHONPATH="$PWD/code:${PYTHONPATH:-}"
 
 WHICH="${*:-1}"
-[ "$WHICH" = "all" ] && WHICH="1 2 3"
+[ "$WHICH" = "all" ] && WHICH="1 1b 2 3"
 
 LOG_TS=$(date +%Y%m%d_%H%M%S)
 run() {
@@ -28,10 +28,11 @@ run() {
 mkdir -p logs
 for n in $WHICH; do
     case $n in
-        1) run 1 exp1_hard_negatives ;;
-        2) run 2 exp2_error_mechanism ;;
-        3) run 3 exp3_ablation ;;
-        *) echo "unknown experiment: $n" ;;
+        1)  run 1  exp1_hard_negatives ;;
+        1b) run 1b exp1b_cross_format ;;
+        2)  run 2  exp2_error_mechanism ;;
+        3)  run 3  exp3_ablation ;;
+        *)  echo "unknown experiment: $n" ;;
     esac
 done
 
