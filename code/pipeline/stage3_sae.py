@@ -20,7 +20,7 @@ import torch.nn as nn
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pipeline.config import (
     SAE_K, SAE_RATIO, SAE_LR, SAE_EPOCHS, SAE_BATCH,
-    WARMUP_STEPS, AUX_W, DEAD_THR, ckpt_acts, ckpt_sae
+    WARMUP_STEPS, AUX_W, DEAD_THR, ckpt_acts, ckpt_sae, get_device
 )
 
 
@@ -54,24 +54,27 @@ class TopKSAE(nn.Module):
         self.W_dec.data = nn.functional.normalize(self.W_dec.data, dim=1)
 
 
-def train_one_layer(layer: int, train_acts: torch.Tensor) -> dict:
+def train_one_layer(layer: int, train_acts: torch.Tensor, device=None) -> dict:
     D_MODEL = train_acts.shape[1]
     D_SAE   = D_MODEL * SAE_RATIO
+    device  = device or get_device()
 
-    sae        = TopKSAE(D_MODEL, D_SAE, SAE_K)
+    sae        = TopKSAE(D_MODEL, D_SAE, SAE_K).to(device)
     optimizer  = torch.optim.Adam(sae.parameters(), lr=SAE_LR)
     loader     = torch.utils.data.DataLoader(
-        torch.utils.data.TensorDataset(train_acts),
+        torch.utils.data.TensorDataset(train_acts),   # kept on CPU; moved per-batch
         batch_size=SAE_BATCH, shuffle=True,
     )
-    feat_usage = torch.zeros(D_SAE)
+    feat_usage = torch.zeros(D_SAE, device=device)
     history    = []
     step       = 0
 
-    print(f"  Training SAE  layer={layer}  d_sae={D_SAE}  k={SAE_K}  epochs={SAE_EPOCHS}")
+    print(f"  Training SAE  layer={layer}  d_sae={D_SAE}  k={SAE_K}  "
+          f"epochs={SAE_EPOCHS}  device={device}")
     for epoch in range(SAE_EPOCHS):
         e_mse = 0.0
         for (x,) in loader:
+            x = x.to(device)
             lr = SAE_LR * min(1.0, step / max(1, WARMUP_STEPS))
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
@@ -103,13 +106,15 @@ def train_one_layer(layer: int, train_acts: torch.Tensor) -> dict:
 
     sae.eval()
     with torch.no_grad():
-        s = train_acts[:1000]
+        s = train_acts[:1000].to(device)
         var_expl = float(1 - (s - sae(s)[1]).pow(2).sum() / s.pow(2).sum())
     n_live = int((feat_usage > DEAD_THR).sum())
     print(f"  Done: var_expl={var_expl:.2%}  live={n_live}/{D_SAE}")
 
+    # move params back to CPU so the checkpoint loads on any device
+    cpu_state = {k: v.detach().cpu() for k, v in sae.state_dict().items()}
     return dict(
-        state_dict=sae.state_dict(),
+        state_dict=cpu_state,
         history=history,
         var_expl=var_expl,
         n_live=n_live,

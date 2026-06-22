@@ -6,18 +6,27 @@ Outputs:
                      hold_multi_compute, hold_multi_cheat
 """
 
-import pickle, sys
+import os, pickle, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from data_gen import make_dataset, make_multi_op_holdout, split_dataset, make_ctrl_data
+from data_gen import (make_dataset, make_loguniform_dataset,
+                      make_multi_op_holdout, split_dataset, make_ctrl_data)
 from pipeline.config import (
     N_PER_CELL, N_CTRL, HOLDOUT_FRAC, OPS_EVAL, ckpt_data
 )
 
+# SAE_DATA_MODE=loguniform → magnitude-stratified sampling (decorrelates
+# magnitude from operation); anything else → the original per-bin sampler.
+DATA_MODE  = os.getenv("SAE_DATA_MODE", "standard")
+N_PER_OP   = int(os.getenv("SAE_N_PER_OP", "1500"))
+
 def main():
-    print("Stage 1 — generating dataset …")
-    all_data = make_dataset(n_per_cell=N_PER_CELL, ops=OPS_EVAL)
+    print(f"Stage 1 — generating dataset … (mode={DATA_MODE})")
+    if DATA_MODE == "loguniform":
+        all_data = make_loguniform_dataset(n_per_op=N_PER_OP, ops=OPS_EVAL)
+    else:
+        all_data = make_dataset(n_per_cell=N_PER_CELL, ops=OPS_EVAL)
     train, hold_per_op, hold_cheat = split_dataset(all_data, holdout_frac=HOLDOUT_FRAC)
     ctrl_data      = make_ctrl_data(N_CTRL)
     train_corpus   = [r for r in train if r["variant"] in ("compute", "copy")] + ctrl_data

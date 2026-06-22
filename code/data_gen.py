@@ -192,6 +192,101 @@ def _sample_pair(op, bin_name, rng):
                 return a, b, a // b
     return None  # no valid pair found
 
+def _sample_pair_loguniform(op, rng, mag_lo, mag_hi):
+    """Sample one (a, b, result) with operands drawn LOG-uniformly over
+    10^mag_lo .. 10^mag_hi, so log10(operand) is ~uniform. This flattens the
+    magnitude distribution and (for add/sub/mul) matches operand-magnitude
+    coverage across operations, so magnitude can be regressed out cleanly.
+
+    div is handled as quotient×divisor (its dividend therefore differs — an
+    unavoidable asymmetry, recorded via the operands for later regression)."""
+    def lu():                       # one log-uniform integer ≥ 1
+        return max(1, int(10 ** rng.uniform(mag_lo, mag_hi)))
+    for _ in range(200):
+        if op == "add":
+            a, b = lu(), lu()
+            return a, b, a + b
+        if op == "sub":
+            a, b = lu(), lu()
+            a, b = max(a, b), min(a, b)
+            return a, b, a - b
+        if op == "mul":
+            a, b = lu(), lu()
+            if a * b < 100_000_000:
+                return a, b, a * b
+        if op == "div":
+            b = lu()
+            q = max(1, int(10 ** rng.uniform(0, mag_hi)))   # quotient = result
+            a = q * b
+            if a < 100_000_000:
+                return a, b, q
+    return None
+
+
+def make_loguniform_dataset(
+    n_per_op: int = 1500,
+    ops: list = None,
+    mag_lo: float = 0.0,
+    mag_hi: float = 4.0,
+    seed: int = 42,
+    include_copy: bool = True,
+) -> list:
+    """Magnitude-stratified dataset: operands sampled LOG-uniformly so the result
+    magnitude is spread evenly across scales and has common support across
+    operations (the fix for the magnitude-vs-operation confound).
+
+    Same record schema as make_dataset (op, variant, fmt, bin, a, b, expected,
+    prompt); `bin` is the result's digit-count (1d..5d, capped) so downstream
+    per-bin grouping still works and now reflects magnitude.
+    """
+    if ops is None:
+        ops = ["add", "sub", "mul", "div"]
+    rng  = random.Random(seed)
+    data = []
+
+    def bin_of(r):
+        return f"{min(max(len(str(abs(r))), 1), 5)}d"
+
+    for op in ops:
+        templates = TEMPLATES[op]
+        made = 0
+        while made < n_per_op:
+            pair = _sample_pair_loguniform(op, rng, mag_lo, mag_hi)
+            if pair is None:
+                continue
+            a, b, c = pair
+            bin_name = bin_of(c)
+            spellable = (a < 100000 and b < 100000 and c < 100000)
+            for fmt, compute_t, cheat_t, copy_t in templates:
+                if fmt == "verbal" and not spellable:
+                    continue
+                base = dict(op=op, bin=bin_name, fmt=fmt, a=a, b=b, expected=c)
+                data.append({**base, "variant": "compute",
+                              "prompt": _fill(compute_t, a, b, c)})
+                data.append({**base, "variant": "cheat",
+                              "prompt": _fill(cheat_t, a, b, c)})
+                if copy_t:
+                    data.append({**base, "variant": "copy_op",
+                                  "prompt": _fill(copy_t, a, b, c)})
+            made += 1
+
+    # standalone copy examples (no math) — log-uniform numbers
+    if include_copy:
+        for _ in range(n_per_op):
+            c = max(1, int(10 ** rng.uniform(mag_lo, mag_hi)))
+            for fmt, copy_t in COPY_TEMPLATES:
+                if fmt == "verbal" and c >= 100000:
+                    continue
+                wc = _num_to_words(c) if c < 100000 else ""
+                data.append(dict(op="copy", variant="copy", fmt=fmt,
+                                 bin=f"{min(len(str(c)),5)}d", a=None, b=None,
+                                 expected=c,
+                                 prompt=copy_t.replace("{c}", str(c)).replace("{wc}", wc)))
+
+    rng.shuffle(data)
+    return data
+
+
 def make_dataset(
     n_per_cell: int = 200,
     ops: list = None,
