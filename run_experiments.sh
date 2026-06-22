@@ -17,6 +17,7 @@ export PYTHONPATH="$PWD/code:${PYTHONPATH:-}"
 
 WHICH="${*:-1}"
 [ "$WHICH" = "all" ] && WHICH="1 1b 2 3 4 5"
+[ "$WHICH" = "gen" ] && WHICH="gen-collect gen-train gen-interpret"
 
 LOG_TS=$(date +%Y%m%d_%H%M%S)
 run() {
@@ -34,6 +35,9 @@ for n in $WHICH; do
         3)  run 3  exp3_ablation ;;
         4)  run 4  exp4_composition ;;
         5)  run 5  exp5_interpret_features ;;
+        gen-collect)   run gen_collect   gen_collect ;;
+        gen-train)     run gen_train     gen_train ;;
+        gen-interpret) run gen_interpret gen_interpret ;;
         *)  echo "unknown experiment: $n" ;;
     esac
 done
