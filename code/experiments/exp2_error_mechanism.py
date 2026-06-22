@@ -16,7 +16,7 @@ Reads : results/checkpoints/{acts_checkpoint.pt, sae_L{best}.pt, data.pkl}
 Outputs: results/exp2_error_mechanism.json, results/exp2_error_mechanism.png
 """
 
-import json, sys
+import csv, json, os, sys
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +35,14 @@ import experiments._common as C
 
 sns.set_theme(style="whitegrid", font_scale=0.9)
 
+# ── problem regime (override via env) ─────────────────────────────────────────
+# Default to a single operation across two adjacent bins → a spread of easy and
+# hard problems at MATCHED operation, so correct/wrong differ in difficulty only
+# (sliceable per-bin via the CSV) rather than also in operation + answer scale.
+EXP2_OPS  = os.getenv("EXP2_OPS",  "mul").split(",")
+EXP2_BINS = os.getenv("EXP2_BINS", "1d,2d").split(",")
+EXP2_N    = int(os.getenv("EXP2_N", "200"))
+
 
 def main():
     acts_ck = C.load_acts_checkpoint()
@@ -50,9 +58,9 @@ def main():
     print(f"  fingerprints for ops: {sorted(fps)}")
 
     # 2. Hard problems → correctness + last-token activations
-    probs = make_hard_problems(ops=[op for op in ["mul", "div"] if op in fps],
-                               bins=["3d", "4d", "5d"], n_per_cell=150)
-    print(f"  {len(probs)} hard problems")
+    ops_use = [op for op in EXP2_OPS if op in fps]
+    probs = make_hard_problems(ops=ops_use, bins=EXP2_BINS, n_per_cell=EXP2_N)
+    print(f"  {len(probs)} problems   ops={ops_use}  bins={EXP2_BINS}")
 
     model, tok, device = C.load_model()
     answers = C.generate_answers([r["prompt"] for r in probs], model, tok, device)
@@ -88,19 +96,35 @@ def main():
     auc_strength = safe_auc(strength, correct)
     auc_cosine   = safe_auc(cos_comp, correct)
 
-    # 5. Baseline — logistic probe on the raw hidden state
+    # 5. Baselines.
+    #    (a) logistic probe on the raw hidden state
+    #    (b) magnitude-only probe — predict correctness from problem difficulty
+    #        alone (operand sizes + answer scale). If this matches the hidden
+    #        probe, "correctness" is really a difficulty/magnitude confound.
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
-    if correct.sum() >= 5 and (~correct).sum() >= 5:
-        auc_probe = float(cross_val_score(
-            LogisticRegression(max_iter=500, C=0.1),
-            norm.numpy(), correct.astype(int), cv=cv, scoring="roc_auc").mean())
-    else:
-        auc_probe = float("nan")
+    have_both = correct.sum() >= 5 and (~correct).sum() >= 5
 
-    print(f"\n  predicting correctness:")
+    def cv_auc(X):
+        return float(cross_val_score(LogisticRegression(max_iter=500, C=0.1),
+                                     X, correct.astype(int), cv=cv,
+                                     scoring="roc_auc").mean())
+
+    if have_both:
+        auc_probe = cv_auc(norm.numpy())
+        mag = np.array([[np.log10(abs(r["a"]) + 1), np.log10(abs(r["b"]) + 1),
+                         np.log10(abs(r["expected"] or 0) + 1)] for r in probs])
+        auc_magnitude = cv_auc(mag)
+    else:
+        auc_probe = auc_magnitude = float("nan")
+
+    print(f"\n  accuracy={correct.mean():.1%}  "
+          f"({correct.sum()} correct / {(~correct).sum()} wrong)")
+    print(f"  predicting correctness:")
     print(f"    fingerprint strength AUC : {auc_strength:.3f}")
     print(f"    cosine-to-compute    AUC : {auc_cosine:.3f}")
     print(f"    hidden-state probe   AUC : {auc_probe:.3f}  (baseline)")
+    print(f"    magnitude-only       AUC : {auc_magnitude:.3f}  "
+          f"(difficulty confound check)")
     verdict = ("MECHANISM SUPPORTED — wrong answers have weaker fingerprints"
                if auc_strength > 0.65 else
                "NO FINGERPRINT SIGNAL — wrong answers fire the fingerprint normally")
@@ -126,16 +150,39 @@ def main():
     plt.savefig(OUT_DIR / "exp2_error_mechanism.png", dpi=150, bbox_inches="tight")
     plt.close()
 
+    # 7. Per-problem dump — inspect exactly which problems were wrong, with the
+    #    model's answer and every signal, sliceable by op/bin offline.
+    csv_path = OUT_DIR / "exp2_per_problem.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["op", "bin", "a", "b", "expected", "model_answer",
+                    "correct", "fp_strength", "cos_compute", "prompt"])
+        for i, r in enumerate(probs):
+            w.writerow([r["op"], r["bin"], r["a"], r["b"], r["expected"],
+                        answers[i], int(correct[i]),
+                        f"{strength[i]:.6f}", f"{cos_comp[i]:.6f}", r["prompt"]])
+
+    # per-bin accuracy, so the difficulty spread is visible at a glance
+    acc_by_bin = {}
+    for bn in EXP2_BINS:
+        idx = [i for i, r in enumerate(probs) if r["bin"] == bn]
+        if idx:
+            acc_by_bin[bn] = float(np.mean([correct[i] for i in idx]))
+    print(f"  accuracy by bin: " +
+          "  ".join(f"{bn}={a:.0%}" for bn, a in acc_by_bin.items()))
+
     out = dict(
-        best_layer=best, n=len(probs), accuracy=float(correct.mean()),
+        best_layer=best, ops=ops_use, bins=EXP2_BINS, n=len(probs),
+        accuracy=float(correct.mean()), accuracy_by_bin=acc_by_bin,
         n_correct=int(correct.sum()), n_wrong=int((~correct).sum()),
         auc_fingerprint_strength=auc_strength, auc_cosine=auc_cosine,
-        auc_hidden_probe=auc_probe, beats_baseline=bool(beats_baseline),
-        verdict=verdict,
+        auc_hidden_probe=auc_probe, auc_magnitude_only=auc_magnitude,
+        beats_baseline=bool(beats_baseline), verdict=verdict,
     )
     (OUT_DIR / "exp2_error_mechanism.json").write_text(json.dumps(out, indent=2))
-    print(f"\nResults → {OUT_DIR/'exp2_error_mechanism.json'}")
-    print(f"Plot    → {OUT_DIR/'exp2_error_mechanism.png'}")
+    print(f"\nResults    → {OUT_DIR/'exp2_error_mechanism.json'}")
+    print(f"Per-problem → {csv_path}")
+    print(f"Plot       → {OUT_DIR/'exp2_error_mechanism.png'}")
 
 
 if __name__ == "__main__":

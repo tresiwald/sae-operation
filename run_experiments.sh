@@ -16,7 +16,7 @@ source .venv/bin/activate
 export PYTHONPATH="$PWD/code:${PYTHONPATH:-}"
 
 WHICH="${*:-1}"
-[ "$WHICH" = "all" ] && WHICH="1 1b 2 3"
+[ "$WHICH" = "all" ] && WHICH="1 1b 2 3 4 5"
 
 LOG_TS=$(date +%Y%m%d_%H%M%S)
 run() {
@@ -32,6 +32,8 @@ for n in $WHICH; do
         1b) run 1b exp1b_cross_format ;;
         2)  run 2  exp2_error_mechanism ;;
         3)  run 3  exp3_ablation ;;
+        4)  run 4  exp4_composition ;;
+        5)  run 5  exp5_interpret_features ;;
         *)  echo "unknown experiment: $n" ;;
     esac
 done
