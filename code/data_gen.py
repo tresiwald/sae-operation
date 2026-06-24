@@ -596,6 +596,100 @@ def make_hard_problems(ops: list = None, bins: list = None,
     return data
 
 
+# ── Robustness families (Experiment 6: compute vs retrieve) ───────────────────
+def make_robustness_families(ops: list = None, bins: list = None,
+                             n_families: int = 150, n_perturb: int = 8,
+                             max_delta: int = 3, seed: int = 771) -> list:
+    """Magnitude-matched perturbation families for the compute-vs-retrieve test.
+
+    Each family = one BASE problem (a,b) plus up to `n_perturb` NEIGHBOURS made
+    by nudging a and/or b by a small delta while keeping the SAME digit-count, so
+    every member of a family shares operand magnitude. The logic:
+
+      - If the model genuinely COMPUTES the base, it should also solve the
+        magnitude-matched neighbours → robust family.
+      - If it RETRIEVED / heuristic-matched the base, the neighbours break →
+        brittle family, even though the base was correct.
+
+    Brittleness (computed in exp6) is thus a magnitude-controlled proxy for
+    "retrieval vs computation": both members of a family have identical operand
+    magnitude, so a fingerprint that predicts brittleness is NOT just the
+    magnitude code.
+
+    Returns records with: op, variant='compute', fmt='symbolic', bin, a, b,
+    expected, family_id, role ('base'|'perturb'), prompt.
+    """
+    if ops  is None: ops  = ["add", "sub", "mul"]
+    if bins is None: bins = ["2d", "3d", "4d"]
+    rng  = random.Random(seed)
+    data = []
+    fid  = 0
+
+    def same_len(x, y):
+        return len(str(abs(x))) == len(str(abs(y)))
+
+    def result_of(op, a, b):
+        """Valid result or None if the operation is invalid on (a,b)."""
+        if op == "add": return a + b
+        if op == "sub": return a - b if a >= b else None
+        if op == "mul": return a * b if a * b < 100_000_000 else None
+        if op == "div": return a // b if (b != 0 and a % b == 0 and a // b > 0) else None
+        return None
+
+    for op in ops:
+        for bin_name in bins:
+            lo, hi = BINS[bin_name]
+            made, attempts = 0, 0
+            while made < n_families and attempts < n_families * 60:
+                attempts += 1
+                a0 = rng.randint(lo, hi)
+                b0 = rng.randint(lo, hi)
+                if op == "sub" and a0 < b0:
+                    a0, b0 = b0, a0
+                c0 = result_of(op, a0, b0)
+                if c0 is None:
+                    continue
+
+                # build magnitude-matched neighbours
+                neigh, seen, tries = [], {(a0, b0)}, 0
+                while len(neigh) < n_perturb and tries < n_perturb * 25:
+                    tries += 1
+                    da = rng.randint(-max_delta, max_delta)
+                    db = rng.randint(-max_delta, max_delta)
+                    if da == 0 and db == 0:
+                        continue
+                    a1, b1 = a0 + da, b0 + db
+                    if (a1, b1) in seen or not (lo <= a1 <= hi and lo <= b1 <= hi):
+                        continue
+                    if not (same_len(a1, a0) and same_len(b1, b0)):
+                        continue
+                    if op == "sub" and a1 < b1:
+                        continue
+                    c1 = result_of(op, a1, b1)
+                    if c1 is None:
+                        continue
+                    seen.add((a1, b1))
+                    neigh.append((a1, b1, c1))
+
+                # need enough neighbours to estimate brittleness
+                if len(neigh) < max(3, n_perturb // 2):
+                    continue
+
+                data.append(dict(op=op, variant="compute", fmt="symbolic",
+                                 bin=bin_name, a=a0, b=b0, expected=c0,
+                                 family_id=fid, role="base",
+                                 prompt=f"{a0}{_PROBE_SYM[op]}{b0}="))
+                for a1, b1, c1 in neigh:
+                    data.append(dict(op=op, variant="compute", fmt="symbolic",
+                                     bin=bin_name, a=a1, b=b1, expected=c1,
+                                     family_id=fid, role="perturb",
+                                     prompt=f"{a1}{_PROBE_SYM[op]}{b1}="))
+                fid  += 1
+                made += 1
+    rng.shuffle(data)
+    return data
+
+
 # ── Train / holdout split ─────────────────────────────────────────────────────
 def split_dataset(data: list[dict], holdout_frac: float = 0.2, seed: int = 0):
     """

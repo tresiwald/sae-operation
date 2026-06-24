@@ -16,7 +16,7 @@ source .venv/bin/activate
 export PYTHONPATH="$PWD/code:${PYTHONPATH:-}"
 
 WHICH="${*:-1}"
-[ "$WHICH" = "all" ] && WHICH="1 1b 2 3 4 5"
+[ "$WHICH" = "all" ] && WHICH="1 1b 2 3 4 5 6"
 [ "$WHICH" = "gen" ] && WHICH="gen-collect gen-train gen-interpret"
 
 LOG_TS=$(date +%Y%m%d_%H%M%S)
@@ -35,6 +35,7 @@ for n in $WHICH; do
         3)  run 3  exp3_ablation ;;
         4)  run 4  exp4_composition ;;
         5)  run 5  exp5_interpret_features ;;
+        6)  run 6  exp6_robustness ;;
         gen-collect)   run gen_collect   gen_collect ;;
         gen-train)     run gen_train     gen_train ;;
         gen-interpret) run gen_interpret gen_interpret ;;
